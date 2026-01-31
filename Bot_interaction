@@ -1,0 +1,397 @@
+# BOT INTERACTION!
+
+In this notebook, we will run a live demo demonstrating how our historically aware chatbot works.
+
+This allows us to better visualize the chatbot's behavior in a real-world setting, rather than limiting it to an academic environment.
+
+# Installation & Libraries
+
+!pip install -q pymongo FlagEmbedding transformers accelerate bitsandbytes sentence_transformers
+
+import os
+import torch
+import numpy as np
+import pandas as pd
+from tqdm.notebook import tqdm
+from pymongo import MongoClient
+from google.colab import userdata
+from FlagEmbedding import BGEM3FlagModel
+from collections import defaultdict
+from IPython.display import display, Markdown, clear_output
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from sentence_transformers import CrossEncoder
+from transformers import logging as hf_logging
+import warnings
+
+# Remore warnings/verbosity
+warnings.filterwarnings("ignore")
+hf_logging.set_verbosity_error()
+
+# MongoDB: Connenction
+
+# Connect to Mongo
+MONGO_link = userdata.get('MONGO_link')
+client = MongoClient(MONGO_link)
+db = client["Business"]
+collection = db["Intelligence"]
+
+# Create doc_rag (The list of dictionaries)
+all_doc = collection.find()
+doc_rag = []
+
+for doc in all_doc:
+  full_course = {
+      "id": doc.get("_id", "N/A"),
+      "course_name": doc.get("Course name", "N/A"),
+      "Contents": doc.get("Contents", "N/A"),
+      "Learning objectives": doc.get("Learning objectives", "N/A"),
+      "Detailed Program": doc.get("Detailed Program", "N/A"),
+      "Mandatory": doc.get("Mandatory", "N/A"),
+      "Year": doc.get("Year", "N/A"),
+      "General course name": doc.get("General course name", "N/A"),
+      "Assessment method": doc.get("Assessment method", "N/A"),
+      "Field of research": doc.get("Field of research", "N/A"),
+      "Prerequisites": doc.get("Prerequisites", "N/A"),
+      "ECTS": doc.get("ECTS", "N/A"),
+      "Source URL": doc.get("Source URL", "N/A")
+  }
+  doc_rag.append(full_course)
+
+# Model embedding & Chunking (IF necessary)
+
+embedding_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+
+# Chunking
+chunks_collection = db["Intelligence_rag"]
+
+if chunks_collection.count_documents({}) > 0:
+    print("Embeddings found in MongoDB. Loading them directly (Skipping generation).")
+
+else:
+    print("Database empty or update requested. Generating new embeddings.")
+
+    # START GENERATION LOGIC
+    all_doc = collection.find()
+    doc_rag = []
+
+    # Map General Names to their Modules
+    general_course_map = defaultdict(list)
+    # Pre-fetch for mapping
+    temp_docs = list(all_doc)
+    for doc in temp_docs:
+        gen_name = doc.get("General course name", "N/A")
+        course_name = doc.get("Course name", "Unknown")
+        if gen_name != "N/A" and gen_name != course_name:
+            general_course_map[gen_name].append(course_name)
+
+    database_records = []
+
+    for doc in tqdm(temp_docs, desc="Processing Syllabus & Embedding"):
+        course_name = doc.get("Course name", "Unknown")
+        gen_name = doc.get("General course name", "N/A")
+
+        # Integration Logic
+        integration_note = ""
+        if gen_name in general_course_map and len(general_course_map[gen_name]) > 1:
+            siblings = [m for m in general_course_map[gen_name] if m != course_name]
+            siblings_str = ", ".join(siblings)
+            integration_note = (
+                f" IMPORTANT: This course is a module of the integrated course '{gen_name}'. "
+                f"To complete the exam and record the grade, the student must also pass the other module(s): {siblings_str}."
+            )
+
+        structural_chunks = []
+
+        # Chunk 1: Identity
+        admin_text = (
+            f"Course: {course_name}. General Name: {gen_name}. "
+            f"Year: {doc.get('Year','N/A')}. Mandatory: {doc.get('Mandatory','N/A')}. "
+            f"ECTS Credits: {doc.get('ECTS','N/A')}. Field of Research: {doc.get('Field of research','N/A')}."
+        )
+        structural_chunks.append(admin_text)
+
+        # Chunk 2: Content
+        content_text = (
+            f"Course: {course_name}. Contents: {doc.get('Contents','N/A')}. "
+            f"Detailed Program: {doc.get('Detailed Program','N/A')}."
+        )
+        structural_chunks.append(content_text)
+
+        # Chunk 3: Objectives
+        obj_text = f"Course: {course_name}. Learning Objectives: {doc.get('Learning objectives','N/A')}."
+        structural_chunks.append(obj_text)
+
+        # Chunk 4: Requirements & Assessment
+        req_text = (
+            f"Course: {course_name}. Prerequisites: {doc.get('Prerequisites','N/A')}. "
+            f"Assessment Method: {doc.get('Assessment method','N/A')}. {integration_note}"
+        )
+        structural_chunks.append(req_text)
+
+        # Encode
+        output = embedding_model.encode(structural_chunks, return_dense=True, return_sparse=True, return_colbert_vecs=False)
+        dense_vecs = output['dense_vecs']
+        lexical_weights = output['lexical_weights']
+
+        for i, text_content in enumerate(structural_chunks):
+            sparse_cleaned = {str(k): float(v) for k, v in lexical_weights[i].items()}
+            record = {
+                "chunk_id": f"{str(doc.get('_id', 'N/A'))}_{i}",
+                "text": text_content,
+                "metadata": {"course_name": course_name, "source_url": doc.get('Source URL', 'N/A')},
+                "dense_vec": dense_vecs[i].tolist(),
+                "sparse_vec": sparse_cleaned
+            }
+            database_records.append(record)
+
+    # Insert chunks
+    chunks_collection.insert_many(database_records)
+
+# Hybrid score & Search
+
+# Load all chunks for search
+all_chunks = list(chunks_collection.find())
+doc_dense_matrix = np.array([r['dense_vec'] for r in all_chunks])
+
+# Load CrossEncoder for Reranking
+reranker = CrossEncoder('BAAI/bge-reranker-v2-m3', device='cuda', automodel_args={"dtype": torch.float16})
+
+def compute_hybrid_score(query_dense, query_sparse, doc_matrix, chunks_list, alpha=2.0):
+    dense_scores = doc_matrix @ query_dense
+    final_scores = []
+    for i, record in enumerate(chunks_list):
+        doc_sparse = record['sparse_vec']
+        sparse_score = 0
+        for token_id, query_weight in query_sparse.items():
+            token_key = str(token_id)
+            if token_key in doc_sparse:
+                sparse_score += query_weight * doc_sparse[token_key]
+        total_score = dense_scores[i] + (alpha * sparse_score)
+        final_scores.append((total_score, record))
+    return final_scores
+
+
+def search_mongo(query, top_k=7, fetch_k=20):
+    output = embedding_model.encode([query], return_dense=True, return_sparse=True, return_colbert_vecs=False)
+    query_dense = output['dense_vecs'][0]
+    query_sparse = output['lexical_weights'][0]
+
+    initial_results = compute_hybrid_score(query_dense, query_sparse, doc_dense_matrix, all_chunks)
+    initial_results.sort(key=lambda x: x[0], reverse=True)
+    candidates = initial_results[:fetch_k]
+
+    if not candidates: return []
+
+    cross_inp = [[query, item[1]['text']] for item in candidates]
+    cross_scores = reranker.predict(cross_inp)
+
+    reranked_results = []
+    for i, score in enumerate(cross_scores):
+        reranked_results.append((score, candidates[i][1]))
+    reranked_results.sort(key=lambda x: x[0], reverse=True)
+    return reranked_results[:top_k]
+
+
+# LLM: Load & Initialization
+
+# Configuration for 4-bit loading
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+local_model = AutoModelForCausalLM.from_pretrained(
+    model_name, quantization_config=bnb_config, device_map="auto", trust_remote_code=True, attn_implementation="sdpa"
+)
+
+
+@torch.inference_mode()
+def generate_with_qwen(prompt, system_instruction, temperature=0.7, do_sample=True):
+    messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
+
+    text = tokenizer.apply_chat_template(messages,
+                                         tokenize=False,
+                                         add_generation_prompt=True
+                                         )
+
+    model_inputs = tokenizer([text], return_tensors="pt").to(local_model.device)
+
+    # if TRUE -> chatting and use temperature
+    # if FALSE -> rewrite and NO temperature
+    if do_sample:
+        generated_ids = local_model.generate(**model_inputs,
+                                             max_new_tokens=512,
+                                             temperature=temperature,
+                                             do_sample=True
+                                             )
+    else:
+        generated_ids = local_model.generate(**model_inputs,
+                                             max_new_tokens=512,
+                                             do_sample=False    # Greedy mode
+                                             )
+
+    generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)]
+
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+SYSTEM_PROMPT = """
+You are the AI Academic Advisor for the University of Milan-Bicocca Data Science Master's.
+Your source of truth is strictly the provided Context.
+
+### GUIDELINES:
+
+1. **RELEVANCE FILTER:** The Context may contain information about multiple courses. **You must ONLY use the information related to the specific course the user is currently asking about.** Ignore chunks belonging to other courses.
+
+2. **NO FLUFF:** Answer immediately.
+   - BAD: "Based on the syllabus, the course is..."
+   - GOOD: "The course is worth 6 ECTS."
+
+3. **INTEGRATED COURSES:** If a course is a module of a larger Integrated Course, your answer MUST start with a warning:
+   - "Note: This is a module of [Integrated Course Name]. You must pass [Other Module Name] to record the grade."
+
+4. **FORMATTING:** - Use **bold** for key terms (e.g., **6 ECTS**, **Mandatory**).
+   - Use bullet points for lists (Prerequisites, Contents, Tools).
+
+5. **UNCERTAINTY:** If the specific answer is not in the context, say: "I do not have that specific information in the syllabus." Do not guess.
+
+6. **SOCIAL INTERACTION:** If the user says "Hello", "Thank you", or "Goodbye":
+   - Ignore the strict context rule.
+   - Reply politely (e.g., "You're welcome!", "Happy to help!", "Good luck with your studies!").
+
+7. **JOBS:** If asked about jobs, infer roles based on skills (e.g., "Potential roles: Data Scientist, Analyst").
+
+### IDENTITY:
+If asked "Who are you?", answer: "I am the AI Advisor for the Data Science Master's program at Milano Bicocca."
+
+CONTEXT:
+"""
+
+# BOT WITH HISTORY
+
+class SyllabusChatbot:
+    def __init__(self):
+        self.history = []
+
+    # this function is defined to decide if we need history or if we should ignore it
+    def contextualize_query(self, user_input):
+        if not self.history:
+            return user_input
+
+        # Create a mini-history string (Last 2 turns)
+        history_str = ""
+        for role, text in self.history[-2:]:
+            history_str += f"{role.upper()}: {text}\n"
+
+        prompt = f"""
+        You are a specialized search query optimizer.
+        Your task is to rewrite the USER'S LAST QUESTION to be fully self-contained, based on the CHAT HISTORY.
+
+        ### INSTRUCTIONS:
+        1. **Identify the Active Topic:** Look at the last AI response to see which specific course was discussed (e.g., "Deep Learning").
+        2. **Resolve Ambiguity:** If the user asks a follow-up question (e.g., "What are the prerequisites?", "How many ECTS?", "Is it mandatory?"), YOU MUST insert the Active Topic into the query.
+        3. **Detect Topic Shifts:** If the user names a NEW course explicitly, YOU MUST IGNORE the history and output a query about the NEW course.
+        4. **Output:** Return ONLY the rewritten query text. No explanations.
+
+        ### EXAMPLES:
+
+        History: USER: Tell me about Deep Learning. AI: It covers neural networks.
+        User Input: "How many ECTS?"
+        Rewritten: "How many ECTS credits is the Foundations of Deep Learning course worth?"
+
+        History: USER: Tell me about Deep Learning. AI: It covers neural networks.
+        User Input: "What about Machine Learning?"
+        Rewritten: "What is the content of the Machine Learning course?"
+
+        History: USER: Is Marketing Analytics mandatory? AI: No, it is optional.
+        User Input: "What are the prerequisites?"
+        Rewritten: "What are the prerequisites for the Marketing Analytics course?"
+
+        ---
+        ACTUAL CHAT HISTORY:
+        {history_str}
+
+        USER'S LAST QUESTION: {user_input}
+
+        REWRITTEN QUERY:
+        """
+
+        # Greedy mode (sample = False)
+        return generate_with_qwen(prompt, "You are a precise query rewriter.", do_sample=False)
+
+    def chat(self, user_input):
+        display(Markdown(f"**👤 USER:** {user_input}"))
+
+        # Rewriting: Only look at the very immediate history (last 2 turns)
+        search_query = self.contextualize_query(user_input)
+
+        # Retrival
+        retrieved_docs = search_mongo(search_query, top_k=7)
+
+        context_text = ""
+        if retrieved_docs:
+            for score, doc in retrieved_docs:
+                course = doc.get('metadata', {}).get('course_name', 'Unknown')
+                url = doc.get('metadata', {}).get('source_url', 'N/A')
+                context_text += f"---\nCourse: {course}\nSource: {url}\nContent: {doc['text']}\n"
+        else:
+            context_text = "No specific documents found."
+
+        # Context Window Management (We only take the last 6 messages (3 User questions + 3 AI Answers))
+        # This prevents the Prompt from growing forever and crashing CUDA.
+        max_history_messages = 6
+        recent_history = self.history[-max_history_messages:]
+
+        # Generate the answer while relying on the history
+        history_context = "CONVERSATION HISTORY (Last 3 turns):\n"
+        for role, text in recent_history:
+            history_context += f"{role.upper()}: {text}\n"
+
+        final_prompt = f"""
+        {history_context}
+
+        NEW CONTEXT FROM DATABASE:
+        {context_text}
+
+        CURRENT QUESTION: {user_input}
+
+        Please answer the Current Question.
+        """
+
+        try:
+            # do sample and temperature = 0.7
+            answer = generate_with_qwen(final_prompt, SYSTEM_PROMPT, temperature=0.7, do_sample=True)
+
+            # Update the history (We keep the full log here in python list, but we only fed the last 6 to the GPU above)
+            self.history.append(("user", user_input))
+            self.history.append(("assistant", answer))
+            return answer
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return str(e)
+
+# Interaction!
+
+# Instantiate the bot
+bot = SyllabusChatbot()
+
+print("="*60)
+print("🎓 SyllabusRAG: AI Academic Advisor is Ready!")
+print("Type 'exit' or 'quit' to stop.")
+print("="*60)
+
+while True:
+    user_input = input("\nType your question: ")
+
+    if user_input.lower() in ["exit", "quit", "stop"]:
+        print("Goodbye! 👋")
+        break
+
+    # Get response
+    response = bot.chat(user_input)
+
+    # Display nicely formatted
+    display(Markdown(f"**🤖 AI:** {response}"))
