@@ -1,0 +1,1027 @@
+# SyllabusRAG: AI Academic Advisor
+This project aims to develop a chatbot that leverages the syllabus of the Data Science Master’s degree at the University of Milano-Bicocca to provide students with accurate and reliable information about the program’s courses. The system is built using a Retrieval-Augmented Generation (RAG) approach, combined with a conversational interface powered by the Qwen3-4B-Instruct model.
+
+# Installation & Libraries
+
+
+
+!pip install -q pymongo FlagEmbedding transformers accelerate bitsandbytes sentence_transformers evaluate bert_score
+
+import os
+import torch
+import random
+import numpy as np
+import pandas as pd
+import evaluate
+from tqdm.notebook import tqdm
+from pymongo import MongoClient
+from google.colab import userdata
+from FlagEmbedding import BGEM3FlagModel
+from collections import defaultdict
+from IPython.display import display, Markdown
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from sentence_transformers import CrossEncoder
+
+# Seed
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+
+
+# MongoDB: Connenction
+
+# Connect to Mongo
+
+MONGO_link = userdata.get('MONGO_link')
+client = MongoClient(MONGO_link)
+db = client["Business"]
+collection = db["Intelligence"]
+
+# Create doc_rag (The list of dictionaries)
+all_doc = collection.find()
+doc_rag = []
+
+for doc in all_doc:
+  full_course = {
+      "id": doc.get("_id", "N/A"),
+      "course_name": doc.get("Course name", "N/A"),
+      "Contents": doc.get("Contents", "N/A"),
+      "Learning objectives": doc.get("Learning objectives", "N/A"),
+      "Detailed Program": doc.get("Detailed Program", "N/A"),
+      "Mandatory": doc.get("Mandatory", "N/A"),
+      "Year": doc.get("Year", "N/A"),
+      "General course name": doc.get("General course name", "N/A"),
+      "Assessment method": doc.get("Assessment method", "N/A"),
+      "Field of research": doc.get("Field of research", "N/A"),
+      "Prerequisites": doc.get("Prerequisites", "N/A"),
+      "ECTS": doc.get("ECTS", "N/A"),
+      "Source URL": doc.get("Source URL", "N/A")
+  }
+  doc_rag.append(full_course)
+
+# MongoDB: Knowledge base construction: Hybrid embeddings and Chunking
+
+
+
+To enable effective retrieval, we must structure the syllabus data. We use the BGE-M3 model, which is unique because it generates two types of embeddings:
+
+*   **Dense Vectors**: Capture semantic meaning.
+
+*   **Sparse Vectors** (Lexical Weights): Capture exact keyword importance, crucial for specific course codes or acronyms.
+
+
+There are two key logic:
+
+
+
+1.   **Integrated Courses**: We implement logic to detect if a course is a "module" of a larger exam. If so, we inject a warning note into the text chunk to ensure the LLM understands the grade recording requirements.
+
+2.   **Structured Chunking**: Each course is split into logical sections (Identity, Content, Objectives, Requirements) to improve retrieval precision.
+
+
+
+
+# Load Embedding model
+
+embedding_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+
+#create a collection to store the chunks
+chunks_collection = db["Intelligence_rag"]
+
+chunks_collection.delete_many({})
+
+# Map General Names to their Modules
+general_course_map = defaultdict(list)
+
+for doc in doc_rag:
+    gen_name = doc.get("General course name", "N/A")
+    course_name = doc.get("course_name", "Unknown")
+
+    # Only group if General Name exists and is different from the specific course name
+    if gen_name != "N/A" and gen_name != course_name:
+        general_course_map[gen_name].append(course_name)
+
+print("Identified Integrated Courses:")
+for gen, modules in general_course_map.items():
+    if len(modules) > 1:
+        print(f"🔗 {gen}: {modules}")
+
+database_records = []
+
+for doc in tqdm(doc_rag, desc="Processing Syllabus"):
+    course_name = doc.get("course_name", "Unknown")
+    gen_name = doc.get("General course name", "N/A")
+
+    integration_note = ""
+    if gen_name in general_course_map and len(general_course_map[gen_name]) > 1:
+        siblings = [m for m in general_course_map[gen_name] if m != course_name]
+        siblings_str = ", ".join(siblings)
+
+        # Sentence for the LLM to deal with the integrated courses
+        integration_note = (
+            f" IMPORTANT: This course is a module of the integrated course '{gen_name}'. "
+            f"To complete the exam and record the grade, the student must also pass the other module(s): {siblings_str}."
+        )
+
+    structural_chunks = []
+
+    # Chunk 1: Identity
+    admin_text = (
+        f"Course: {course_name}. "
+        f"General Name: {gen_name}. "
+        f"Year: {doc['Year']}. "
+        f"Mandatory: {doc['Mandatory']}. "
+        f"ECTS Credits: {doc['ECTS']}. "
+        f"Field of Research: {doc['Field of research']}."
+    )
+    structural_chunks.append(admin_text)
+
+    # Chunk 2: Content
+    content_text = (
+        f"Course: {course_name}. "
+        f"Contents: {doc['Contents']}. "
+        f"Detailed Program: {doc['Detailed Program']}."
+    )
+    structural_chunks.append(content_text)
+
+    # Chunk 3: Objectives
+    obj_text = (
+        f"Course: {course_name}. "
+        f"Learning Objectives: {doc['Learning objectives']}."
+    )
+    structural_chunks.append(obj_text)
+
+    # Chunk 4: Requirements & Assessment as well as integration note for the LLM to read
+    req_text = (
+        f"Course: {course_name}. "
+        f"Prerequisites: {doc['Prerequisites']}. "
+        f"Assessment Method: {doc['Assessment method']}. "
+        f"{integration_note}"
+    )
+    structural_chunks.append(req_text)
+
+    # Encode and Save
+    output = embedding_model.encode(structural_chunks,
+                                    return_dense=True,
+                                    return_sparse=True,
+                                    return_colbert_vecs=False)
+
+    dense_vecs = output['dense_vecs']
+    lexical_weights = output['lexical_weights']
+
+    for i, text_content in enumerate(structural_chunks):
+        sparse_cleaned = {str(k): float(v) for k, v in lexical_weights[i].items()}
+
+        record = {
+            "chunk_id": f"{str(doc['id'])}_{i}",
+            "text": text_content,
+            "metadata": {
+                "course_name": course_name,
+                "source_url": doc['Source URL']
+            },
+            "dense_vec": dense_vecs[i].tolist(),
+            "sparse_vec": sparse_cleaned
+        }
+        database_records.append(record)
+
+# Insert to the chunks into the collection
+chunks_collection.insert_many(database_records)
+
+## Hybrid score and Search Mongo
+
+We implement a two-stage retrieval process to ensure the Chatbot finds the most relevant syllabus details:
+
+
+
+1.   **Stage 1: Hybrid Search:** We combine the Dense score (semantic) and Sparse score (keyword) to retrieve a broad set of candidate documents from MongoDB.
+
+2.   **Stage 2: Reranking:** We use a Cross-Encoder (BGE-Reranker-v2). Unlike vector search, the Cross-Encoder reads the query and the document pair together to output a highly accurate relevance score. This reorders the candidates to ensure the best answer is at the top.
+
+
+
+
+# Load all chunks
+all_chunks = list(chunks_collection.find())
+
+# Create np matrix of documents (N_documents x 1024) [1024 -> dimension of the embedding vector]
+doc_dense_matrix = np.array([r['dense_vec'] for r in all_chunks])
+
+
+# Compute the hybrid score between query and document, using dense and sparse vectors.
+# Alpha is the weight for sparse vectors.
+
+def compute_hybrid_score(query_dense, query_sparse, doc_matrix, chunks_list, alpha=2.0):
+
+    # Dense Score (N_docs x 1024) @ (1024,) -> (N_docs,)
+    dense_scores = doc_matrix @ query_dense
+
+    # Sparse Score
+    final_scores = []
+
+    for i, record in enumerate(chunks_list):
+        doc_sparse = record['sparse_vec']
+        sparse_score = 0
+
+        # Calculate intersection
+        for token_id, query_weight in query_sparse.items():
+            token_key = str(token_id)
+            if token_key in doc_sparse:
+                sparse_score += query_weight * doc_sparse[token_key]
+
+        # Combine
+        total_score = dense_scores[i] + (alpha * sparse_score)
+        final_scores.append((total_score, record))
+
+    return final_scores
+
+# Load CrossEncoder for Reranking
+
+reranker = CrossEncoder(
+    'BAAI/bge-reranker-v2-m3',
+    device='cuda',
+    automodel_args={"dtype": torch.float16}
+)
+
+
+def search_mongo(query, top_k=7, fetch_k=20):
+    # Embed Query
+    output = embedding_model.encode([query],
+                                    return_dense=True,
+                                    return_sparse=True,
+                                    return_colbert_vecs=False)
+
+    query_dense = output['dense_vecs'][0]
+    query_sparse = output['lexical_weights'][0]
+
+    # Hybrid Search (get a lot of candidates)
+    initial_results = compute_hybrid_score(query_dense,
+                                           query_sparse,
+                                           doc_dense_matrix,
+                                           all_chunks
+                                           )
+
+    initial_results.sort(key=lambda x: x[0], reverse=True)
+    candidates = initial_results[:fetch_k]
+
+    # Reranking
+    if not candidates:
+        return []
+
+    # Prepare pairs for CrossEncoder -> [['query', 'doc_text'], ...]
+    cross_inp = [[query, item[1]['text']] for item in candidates]
+    cross_scores = reranker.predict(cross_inp)
+
+    # Attach new scores and sort
+    reranked_results = []
+    for i, score in enumerate(cross_scores):
+        reranked_results.append((score, candidates[i][1])) # (New Score, Doc)
+
+    reranked_results.sort(key=lambda x: x[0], reverse=True)
+
+    return reranked_results[:top_k]
+
+# Local LLM setup
+
+We utilize Qwen3-4B-Instruct, an open-weight LLM.
+The choice of this model is due to that it can outperform larger models in a RAG system because its instruction-tuned behavior makes it better at following prompts, grounding answers in retrieved context, and avoiding hallucinations. Its smaller size also means lower latency and computation resources.
+
+
+The model is loaded in 4-bit mode (using BitsAndBytes) to optimize memory usage while maintaining performance.
+
+
+# Configuration for 4-bit loading (Saves VRAM)
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+model_name = "Qwen/Qwen3-4B-Instruct-2507"
+
+# Load Tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+# Load Model
+local_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True,
+    attn_implementation="sdpa"
+)
+
+
+# Define the generation model and set the 'temperature' to control the creativity
+
+@torch.inference_mode()
+def generate_with_qwen(prompt, system_instruction, temperature=0.7, do_sample=True):
+
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": prompt}
+    ]
+
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    model_inputs = tokenizer([text], return_tensors="pt").to(local_model.device)
+
+    generated_ids = local_model.generate(
+        **model_inputs,
+        max_new_tokens=512,
+        temperature=temperature,
+        do_sample=do_sample,
+        top_p=0.9 if do_sample else None
+    )
+
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return response
+
+
+We define a strict persona for the AI ("Academic Advisor"). It is instructed to be factual, concise, and to explicitly mention if information is missing from the syllabus context.
+
+
+# System prompt
+
+SYSTEM_PROMPT = """
+You are the AI Academic Advisor for the University of Milan-Bicocca Data Science Master's.
+Your source of truth is strictly the provided Context.
+
+### GUIDELINES:
+
+1. **RELEVANCE FILTER:** The Context may contain information about multiple courses. **You must ONLY use the information related to the specific course the user is currently asking about.** Ignore chunks belonging to other courses.
+
+2. **NO FLUFF:** Answer immediately.
+   - BAD: "Based on the syllabus, the course is..."
+   - GOOD: "The course is worth 6 ECTS."
+
+3. **INTEGRATED COURSES:** If a course is a module of a larger Integrated Course, your answer MUST start with a warning:
+   - "Note: This is a module of [Integrated Course Name]. You must pass [Other Module Name] to record the grade."
+
+4. **FORMATTING:** - Use **bold** for key terms (e.g., **6 ECTS**, **Mandatory**).
+   - Use bullet points for lists (Prerequisites, Contents, Tools).
+
+5. **UNCERTAINTY:** If the specific answer is not in the context, say: "I do not have that specific information in the syllabus." Do not guess.
+
+6. **SOCIAL INTERACTION:** If the user says "Hello", "Thank you", or "Goodbye":
+   - Ignore the strict context rule.
+   - Reply politely (e.g., "You're welcome!", "Happy to help!", "Good luck with your studies!").
+
+7. **JOBS:** If asked about jobs, infer roles based on skills (e.g., "Potential roles: Data Scientist, Analyst").
+
+### IDENTITY:
+If asked "Who are you?", answer: "I am the AI Advisor for the Data Science Master's program at Milano Bicocca."
+
+CONTEXT:
+"""
+
+## Model creation
+
+Our objective was to develop a chatbot capable of meaningful interaction with users. To achieve this, the model must maintain conversational history, allowing it to retain context from previous questions and answers. To evaluate the impact of context awareness and retrieval mechanisms, we implemented and compared multiple configurations: a baseline Qwen model without RAG integration, a Qwen model with RAG but without conversational history, and a Qwen model with both RAG integration and history-aware behavior.
+
+# BOT WITHOUT RAG
+
+def generate_baseline(question):
+    """
+    Ask Qwen directly without any Context.
+    Returns the STRING answer (does not just display it).
+    """
+    prompt = f"""
+    I am the AI Advisor for the Data Science Master's program at Milano Bicocca.
+    If you don't know, guess based on general knowledge.
+
+    QUESTION: {question}
+    ANSWER:
+    """
+    return generate_with_qwen(prompt, "You are a helpful assistant.", temperature=0.0, do_sample=False)
+
+# BOT WITHOUT HISTORY
+
+def ask_syllabus_expert(question):
+    """
+    Single-turn RAG function for Evaluation.
+    Uses local Qwen + Local Mongo Search.
+    """
+    # Retrive
+    retrieved_docs = search_mongo(question, top_k=7)
+
+    if not retrieved_docs:
+        return "I couldn't find any relevant information in the database."
+
+    # Build context
+    context_text = ""
+    for score, doc in retrieved_docs:
+        course = doc.get('metadata', {}).get('course_name', 'Unknown Course')
+        url = doc.get('metadata', {}).get('source_url', 'N/A')
+
+        context_text += f"""
+        ---
+        Course: {course}
+        Source: {url}
+        Content: {doc['text']}
+        """
+
+    # Generate Qwen
+    final_prompt = f"""
+    NEW CONTEXT FROM DATABASE:
+    {context_text}
+
+    CURRENT QUESTION: {question}
+
+    Please answer the Current Question based strictly on the context.
+    """
+
+    return generate_with_qwen(final_prompt, SYSTEM_PROMPT, temperature=0.0, do_sample=False)
+
+### Query rewtring mechanism:
+
+
+
+1.   **Contextualization**: If the user asks a follow-up question, the system uses the LLM to rewrite the query to include the necessary context from the chat history.
+
+2.   **Search & Answer**: The rewritten query is sent to the retrieval engine, and the retrieved context is passed to the generation model along with the conversation history.
+
+
+
+
+# BOT WITH HISTORY
+
+class SyllabusChatbot:
+    def __init__(self):
+        self.history = []
+
+    # this function is defined to decide if we need history or if we should ignore it
+    def contextualize_query(self, user_input):
+        if not self.history:
+            return user_input
+
+        # Create a mini-history string (Last 2 turns)
+        history_str = ""
+        for role, text in self.history[-2:]:
+            history_str += f"{role.upper()}: {text}\n"
+
+        prompt = f"""
+        You are a specialized search query optimizer.
+        Your task is to rewrite the USER'S LAST QUESTION to be fully self-contained, based on the CHAT HISTORY.
+
+        ### INSTRUCTIONS:
+        1. **Identify the Active Topic:** Look at the last AI response to see which specific course was discussed (e.g., "Deep Learning").
+        2. **Resolve Ambiguity:** If the user asks a follow-up question (e.g., "What are the prerequisites?", "How many ECTS?", "Is it mandatory?"), YOU MUST insert the Active Topic into the query.
+        3. **Detect Topic Shifts:** If the user names a NEW course explicitly, YOU MUST IGNORE the history and output a query about the NEW course.
+        4. **Output:** Return ONLY the rewritten query text. No explanations.
+
+        ### EXAMPLES:
+
+        History: USER: Tell me about Deep Learning. AI: It covers neural networks.
+        User Input: "How many ECTS?"
+        Rewritten: "How many ECTS credits is the Foundations of Deep Learning course worth?"
+
+        History: USER: Tell me about Deep Learning. AI: It covers neural networks.
+        User Input: "What about Machine Learning?"
+        Rewritten: "What is the content of the Machine Learning course?"
+
+        History: USER: Is Marketing Analytics mandatory? AI: No, it is optional.
+        User Input: "What are the prerequisites?"
+        Rewritten: "What are the prerequisites for the Marketing Analytics course?"
+
+        ---
+        ACTUAL CHAT HISTORY:
+        {history_str}
+
+        USER'S LAST QUESTION: {user_input}
+
+        REWRITTEN QUERY:
+        """
+
+        # Sample = False -> Greedy mode
+        return generate_with_qwen(prompt, "You are a precise query rewriter.", temperature=0.0, do_sample=False)
+
+    def chat(self, user_input, temperature=0.0, do_sample=False):
+        display(Markdown(f"**👤 USER:** {user_input}"))
+
+        # Rewriting: Only look at the very immediate history (last 2 turns)
+        search_query = self.contextualize_query(user_input)
+
+        # Debug: Check what Qwen actually searches for
+        # If user asks "What about Machine Learning?", this MUST NOT say "Deep Learning"
+        if search_query.strip().lower() != user_input.strip().lower():
+             print(f"   Internal Search Query: '{search_query}'")
+
+        # Retrival
+        retrieved_docs = search_mongo(search_query, top_k=7)
+
+        context_text = ""
+        if retrieved_docs:
+            for score, doc in retrieved_docs:
+                course = doc.get('metadata', {}).get('course_name', 'Unknown')
+                url = doc.get('metadata', {}).get('source_url', 'N/A')
+                context_text += f"---\nCourse: {course}\nSource: {url}\nContent: {doc['text']}\n"
+        else:
+            context_text = "No specific documents found."
+
+        # Context Window Management (We only take the last 6 messages (3 User questions + 3 AI Answers))
+        # This prevents the Prompt from growing forever.
+        max_history_messages = 6
+        recent_history = self.history[-max_history_messages:]
+
+        # Generate the answer while relying on the history
+        history_context = "CONVERSATION HISTORY (Last 3 turns):\n"
+        for role, text in recent_history:
+            history_context += f"{role.upper()}: {text}\n"
+
+        final_prompt = f"""
+        {history_context}
+
+        NEW CONTEXT FROM DATABASE:
+        {context_text}
+
+        CURRENT QUESTION: {user_input}
+
+        Please answer the Current Question.
+        """
+
+        try:
+            answer = generate_with_qwen(final_prompt, SYSTEM_PROMPT, temperature=temperature, do_sample=do_sample)
+
+            # Update the history (We keep the full log here in python list, but we only fed the last 6 to the GPU above)
+            self.history.append(("user", user_input))
+            self.history.append(("assistant", answer))
+
+            # Display and Return the chatbot's answer
+            display(Markdown(f"**🤖 AI:** {answer}"))
+            return answer
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return str(e)
+
+# Evaluation set
+
+To measure the effectiveness of our system, we define two different Ground Truth Dataset containing questions.
+
+The first one aims to see how each model perform with different questions covering:
+
+*   ECTS & Credits
+*   Course Content & Tools
+*   Prerequisites
+*   Integrated Course Rules
+
+The second one aims to see how each model perform with the ability to hold an hypotetical conversation with a user. Of course, models that do not implement "history" mode will not be able to answer some questions.
+
+We run the experiments comparing the three approaches:
+
+
+
+1.   **Baseline**: The LLM answers without any external context
+2.   **RAG (No History)**: The system retrieves documents but treats every question as isolated.
+2.   **RAG (With History)**: The full system with query rewriting and memory
+
+
+
+
+
+
+# Define the questions and their answers which will be used as ground truth
+
+test_dataset = [
+    # Introduction, Basic info, and ECTS
+    {
+        "question": "Who are you?",
+        "ground_truth": "I am the AI Advisor for the Data Science Master's program at Milano Bicocca."
+    },
+    {
+        "question": "How many ECTS credits is the Data Visualization course worth?",
+        "ground_truth": "The Data Visualization course is worth 6 ECTS."
+    },
+    {
+        "question": "Is the Marketing Analytics course mandatory?",
+        "ground_truth": "No, Marketing Analytics is not mandatory."
+    },
+    {
+        "question": "Which year is the Business Intelligence and Big Data Analytics course taught in?",
+        "ground_truth": "It is taught in the Second Year."
+    },
+    {
+        "question": "What is the Field of Research code for Big Data in Behavioural Psychology?",
+        "ground_truth": "The field of research code is M-PSI/03."
+    },
+
+    # Content and Tools
+    {
+        "question": "Which programming languages and tools are used in the Machine Learning course?",
+        "ground_truth": "The course primarily uses the KNIME open-source platform for workflows. It also supports integration with R, Weka, Matlab, Python, and Java for advanced analysis."
+    },
+    {
+        "question": "What specific deep learning architectures are covered in the Foundations of Deep Learning course?",
+        "ground_truth": "The course covers Feedforward Networks (MLP), Convolutional Neural Networks (CNNs), Recurrent Neural Networks (RNNs/LSTMs), Deep Transformers (specifically GPT and BERT), and Autoencoders for unsupervised learning."
+    },
+    {
+        "question": "What are the main topics covered in the Green Computing course?",
+        "ground_truth": "The course covers the environmental impact of computing, energy-efficient architectures, and the relationship between Data Science/AI and sustainability."
+    },
+    {
+        "question": "Does the Text Mining and Search course cover Contextualized Word Embeddings?",
+        "ground_truth": "Yes, the course explicitly covers Contextualized Word Embedding techniques, as well as text pre-processing and indexing."
+    },
+    {
+        "question": "What regulations are analyzed in the Juridical and Social Issues in Information Society course?",
+        "ground_truth": "The course analyzes the General Data Protection Regulation (GDPR) and the Artificial Intelligence Act (AIA)."
+    },
+
+    # Prerequisites
+    {
+        "question": "What are the prerequisites for the Foundations of Computer Science course?",
+        "ground_truth": "Basic knowledge of any programming language."
+    },
+    {
+        "question": "Do I need to know Python for the Smart Mobility course?",
+        "ground_truth": "Yes, basic knowledge of the Python language, virtual environments, and Jupyter is required."
+    },
+    {
+        "question": "What prior knowledge is recommended for the High Dimensional Data Analysis course?",
+        "ground_truth": "Prior knowledge of probability, statistical inference, linear algebra, and programming is required. Specifically, familiarity with the linear regression model is emphasized."
+    },
+
+    # Assessment method and Exams
+    {
+        "question": "How is the final grade calculated for the Data Management course?",
+        "ground_truth": "The exam is divided into two parts: Data Management (50%) and Data Visualization (50%)."
+    },
+    {
+        "question": "What is the assessment method for Social Media Analytics?",
+        "ground_truth": "It consists of a written exam (evaluated on a scale from 0 to 24, which must be passed with >= 14.5) and a group project (evalutated on a scale from 0 to 8). The final grade is the sum of both evaluations."
+    },
+    {
+        "question": "How is the exam the Decision Models course done?",
+        "ground_truth": "The assessment consists of a written exam with exercises and open/closed questions, followed by an optional oral exam to assess argumentation ability. The final grade is averaged with the Machine Learning module."
+    },
+    {
+        "question": "Is there a project in the Assessment method for Digital Signal and Image Management?",
+        "ground_truth": "Yes, there is a project discussion (individual or groups of two) regarding the realization of an application for object recognition in real scenes."
+    },
+    {
+        "question": "Can I take an oral exam for the Business Intelligence course?",
+        "ground_truth": "Yes, but the oral exam is optional and can only be taken after passing the mandatory written exam."
+    },
+
+    # Integrated course and modules
+    {
+        "question": "Is 'Big Data in Biotechnology and Biosciences' a standalone course?",
+        "ground_truth": "No, it is a module of the 'Data Science Lab in Biosciences' integrated course, linked with 'Making Sense of Biological Data'."
+    },
+    {
+        "question": "What is the General Course Name for the 'Smart Mobility' module?",
+        "ground_truth": "The general course name is 'Data Science Lab On Smart Cities'."
+    },
+    {
+        "question": "To pass 'Policies for Smart Cities', do I need to work alone?",
+        "ground_truth": "No, students are required to develop a group project (groups of two) focused on a smart city topic."
+    },
+
+    # Specific details
+    {
+        "question": "Which software is used for geospatial data analysis in the Big Data in Geographic Information Systems course?",
+        "ground_truth": "Python is used for geospatial data handling, visualization, and analysis."
+    },
+    {
+        "question": "Does the Reinforcement Learning course cover Deep RL?",
+        "ground_truth": "Yes, it covers function approximation and provides an introduction to Deep Reinforcement Learning."
+    },
+    {
+        "question": "What specific Python library is mentioned for the Smart Mobility lab sessions?",
+        "ground_truth": "GeoPandas is explicitly mentioned for mobility analytics."
+    },
+
+    # Cross-domain and comparisons
+    {
+        "question": "Which course covers the 'Lean Start-up approach'?",
+        "ground_truth": "The Service Science course covers the Lean Start-up approach."
+    },
+    {
+        "question": "Is the Cybersecurity course mandatory?",
+        "ground_truth": "No, it is not mandatory."
+    },
+    {
+        "question": "What is the main output of the project in the Data Visualization course?",
+        "ground_truth": "The final submission is a PDF presentation uploaded to the platform."
+    },
+    {
+        "question": "What is the assessment for Big Data in Public Health for non-attending students?",
+        "ground_truth": "Non-attending students must take a practical exam on R functions (pass/fail). Additionally, they must complete the final questionnaire (80% of grade) and the final project exercise (20% of grade), just like attending students."
+    }
+]
+
+# A single long list of ground truth representing one conversation
+
+long_conversation = [
+    # Introduction
+    {
+        "question": "Hi, who are you?",
+        "ground_truth": "I am the AI Advisor for the Data Science Master's."
+    },
+
+    # Topic A (Deep Learning)
+    {
+        "question": "I am interested in the Foundations of Deep Learning course. Can you briefly list the main architectures covered?",
+        "ground_truth": "It covers Feedforward Networks, Multilayer Perceptron, CNNs, RNNs (including LSTMs), and Deep Transformers like GPT and BERT."
+    },
+
+    # Memory that refers to DL
+    {
+        "question": "How many ECTS is it?",
+        "ground_truth": "The Foundations of Deep Learning course is worth 6 ECTS."
+    },
+
+    # Memory that refers to DL
+    {
+        "question": "And what are the prerequisites?",
+        "ground_truth": "The prerequisites for Foundations of Deep Learning are calculus, statistics, and programming."
+    },
+
+    # Topic Switch (Marketing)
+    {
+        "question": "Okay. What about the Marketing Analytics course? Is it mandatory?",
+        "ground_truth": "No, Marketing Analytics is not mandatory."
+    },
+
+    # Memory that refers to Marketing
+    {
+        "question": "What do I need to know before taking that course?",
+        "ground_truth": "You need to know the Python Programming Language."
+    },
+
+    # Topic Switch (Assessment)
+    {
+        "question": "How is the Data Management course assessed?",
+        "ground_truth": "The exam is divided into two parts: Data Management (50%), which involves a written exam and a project discussion, and Data Visualization (50%), which involves tests and a project."
+    },
+
+    # Complex Switch (Back to DL)
+    {
+        "question": "Going back to the Deep Learning course, does it cover GPT?",
+        "ground_truth": "Yes, the program explicitly mentions Deep Transformers, specifically focusing on architectures like GPT and BERT."
+    },
+
+    # General Question
+    {
+        "question": "What are some examples of the field of research codes assigned to the courses?",
+        "ground_truth": "Examples of field of research codes include INF/01, SECS-S/01, and SECS-P/08."
+    },
+
+    # Closing
+    {
+        "question": "Thank you!",
+        "ground_truth": "You're welcome! If you need anything else, don't hesitate to ask me!"
+    }
+]
+
+# Instantiate
+botQwen = SyllabusChatbot()
+
+First test
+
+# Create a dataset to store the results of all of the different chatbots alongside the question, and the ground truth
+
+results = []
+
+for item in tqdm(test_dataset, desc="Asking Questions"):
+    q = item['question']
+    truth = item['ground_truth']
+
+    print(f"Processing: {q}")
+
+    # Get Baseline Answer
+    baseline_ans = generate_baseline(q)
+
+    # Get RAG Answer
+    # We use a fresh bot instance to ensure history is clear for each question
+    rag_ans = botQwen.chat(q, temperature=0.0, do_sample=False)
+
+    rag_nohist = ask_syllabus_expert(q)
+
+    results.append({
+        "question": q,
+        "ground_truth": truth,
+        "baseline_answer": str(baseline_ans),
+        "rag_answer": str(rag_ans),
+        "rag_without_history_answer": str(rag_nohist)
+    })
+
+df_results = pd.DataFrame(results)
+
+# Save results
+
+df_results.to_csv('evaluation_results_nohistory.csv', index=False)
+
+Second Test
+
+# Long conversation stress test
+
+# Instantiate the History Bot once to accumulate memory
+bot_history = SyllabusChatbot()
+
+long_results = []
+
+for i, turn in enumerate(tqdm(long_conversation, desc="Chat Turns")):
+    q = turn['question']
+    truth = turn['ground_truth']
+
+    print(f"\n[{i+1}/{len(long_conversation)}] User: {q}")
+
+    # The Baseline model
+    ans_baseline = str(generate_baseline(q))
+
+    # RAG without history bot
+    ans_no_history = str(ask_syllabus_expert(q))
+
+    # RAG with history chatbot
+    ans_history = str(bot_history.chat(q, temperature=0.0, do_sample=False))
+
+    long_results.append({
+        "question": q,
+        "ground_truth": truth,
+        "baseline_answer": ans_baseline,
+        "rag_without_history_answer": ans_no_history,
+        "rag_answer": ans_history
+    })
+
+df_long_eval = pd.DataFrame(long_results)
+
+
+# Save results
+
+df_long_eval.to_csv('long_conversation_results.csv', index=False)
+
+# EVALUATION
+
+We use three different metrics to score the AI's answers against the Ground Truth:
+
+
+
+1.   Cosine Similarity: Measures vector alignment.
+
+2.   BERTScore: Compares word overlap and semantic similarity at a token level.
+
+3.   SAS (Semantic Answer Similarity): Uses a Cross-Encoder to judge if the meaning of the answer is identical to the truth, even if the wording is different. This is often considered the most accurate metric for RAG.
+
+
+Additionally, we evaluate Conversational Memory by filtering for follow-up questions that rely on previous turns (e.g., "Is that course mandatory?"). We calculate the "Memory Gap" by comparing the SAS performance of the history-aware model against the history-free baseline on these context-dependent queries.
+
+
+df_results =  pd.read_csv('/content/evaluation_results_nohistory.csv')
+
+# 1. Load Metrics
+bertscore = evaluate.load("bertscore")
+
+sas_model = CrossEncoder('cross-encoder/stsb-roberta-large')
+
+# 2. Define Cosine Function
+def get_cosine_similarity(text1, text2):
+    # Check for empty/None strings to avoid errors
+    if not text1 or not text2: return 0.0
+
+    vec1 = embedding_model.encode([str(text1)], return_dense=True)['dense_vecs'][0]
+    vec2 = embedding_model.encode([str(text2)], return_dense=True)['dense_vecs'][0]
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    return (vec1 @ vec2.T) / (norm1 * norm2)
+
+# Define the evaluation function to calculate the metrics for all three models
+def evaluation_metrics(df):
+
+    # Cosine Similarity
+    df['Base_Cosine']   = df.apply(lambda x: get_cosine_similarity(x['ground_truth'], x['baseline_answer']), axis=1)
+    df['RAG_Hist_Cosine'] = df.apply(lambda x: get_cosine_similarity(x['ground_truth'], x['rag_answer']), axis=1)
+    df['RAG_NoHist_Cosine'] = df.apply(lambda x: get_cosine_similarity(x['ground_truth'], x['rag_without_history_answer']), axis=1)
+
+    # BERTScore
+    base_bert = bertscore.compute(predictions=df['baseline_answer'].astype(str).tolist(), references=df['ground_truth'].tolist(), model_type="distilbert-base-uncased")
+    df['Base_BERTScore'] = base_bert['f1']
+    rag_hist_bert = bertscore.compute(predictions=df['rag_answer'].astype(str).tolist(), references=df['ground_truth'].tolist(), model_type="distilbert-base-uncased")
+    df['RAG_Hist_BERTScore'] = rag_hist_bert['f1']
+    rag_nohist_bert = bertscore.compute(predictions=df['rag_without_history_answer'].astype(str).tolist(), references=df['ground_truth'].tolist(), model_type="distilbert-base-uncased")
+    df['RAG_NoHist_BERTScore'] = rag_nohist_bert['f1']
+
+    # SAS (Cross-Encoder)
+    base_pairs    = [[row['ground_truth'], str(row['baseline_answer'])] for _, row in df.iterrows()]
+    rag_hist_pairs = [[row['ground_truth'], str(row['rag_answer'])] for _, row in df.iterrows()]
+    rag_nohist_pairs = [[row['ground_truth'], str(row['rag_without_history_answer'])] for _, row in df.iterrows()]
+
+    df['Base_SAS']      = sas_model.predict(base_pairs)
+    df['RAG_Hist_SAS']  = sas_model.predict(rag_hist_pairs)
+    df['RAG_NoHist_SAS'] = sas_model.predict(rag_nohist_pairs)
+
+    return df
+
+First Evaluation report
+
+# Display the Evaluation report
+
+df_final = evaluation_metrics(df_results)
+
+
+print("\n" + "="*60)
+print("       EVALUATION REPORT       ")
+print("="*60)
+
+metrics = ['Cosine', 'BERTScore', 'SAS']
+summary_data = []
+
+for m in metrics:
+    # Calculate Means
+    base_mean = df_final[f'Base_{m}'].mean()
+    hist_mean = df_final[f'RAG_Hist_{m}'].mean()
+    nohist_mean = df_final[f'RAG_NoHist_{m}'].mean()
+
+    # Calculate Improvement vs Baseline
+    imp_hist = ((hist_mean - base_mean) / base_mean) * 100
+    imp_nohist = ((nohist_mean - base_mean) / base_mean) * 100
+
+    summary_data.append({
+        "Metric": m,
+        "Baseline": f"{base_mean:.4f}",
+        "RAG (No Hist)": f"{nohist_mean:.4f}",
+        "RAG (History)": f"{hist_mean:.4f}",
+        "Gain (No Hist)": f"{imp_nohist:.1f}%",
+        "Gain (History)": f"{imp_hist:.1f}%"
+    })
+
+df_summary = pd.DataFrame(summary_data)
+display(df_summary)
+
+Second Evaluation report
+
+# load
+
+df_long_eval =  pd.read_csv('long_conversation_results.csv')
+
+# Display the Evaluation report for the long conversation
+
+df_long_final = evaluation_metrics(df_long_eval)
+
+print("\n" + "="*60)
+print("       LONG CONVERSATION EVALUATION REPORT       ")
+print("="*60)
+
+metrics = ['Cosine', 'BERTScore', 'SAS']
+summary_data = []
+
+for m in metrics:
+    # Calculate Means
+    base_mean = df_long_final[f'Base_{m}'].mean()
+    hist_mean = df_long_final[f'RAG_Hist_{m}'].mean()
+    nohist_mean = df_long_final[f'RAG_NoHist_{m}'].mean()
+
+    # Calculate Improvement
+    imp_hist = ((hist_mean - base_mean) / base_mean) * 100
+    imp_nohist = ((nohist_mean - base_mean) / base_mean) * 100
+
+    summary_data.append({
+        "Metric": m,
+        "Baseline": f"{base_mean:.4f}",
+        "RAG (No Hist)": f"{nohist_mean:.4f}",
+        "RAG (History)": f"{hist_mean:.4f}",
+        "Gain (No Hist)": f"{imp_nohist:.1f}%",
+        "Gain (History)": f"{imp_hist:.1f}%"
+    })
+
+display(pd.DataFrame(summary_data))
+
+Memory gap test
+
+# Memory gap
+# We filter for questions that specifically used pronouns like "it" or "that course" [Turns 3, 4, 6, 8]
+print("\n" + "="*60)
+print("        THE MEMORY TEST       ")
+print("="*60)
+
+# Filter for the rows where Memory is required)
+memory_indices = [2, 3, 5]
+df_memory_subset = df_long_final.iloc[memory_indices].copy()
+
+# Calculate specific score for memory questions
+mem_score = df_memory_subset['RAG_Hist_SAS'].mean()
+no_mem_score = df_memory_subset['RAG_NoHist_SAS'].mean()
+
+print(f"Average SAS Score on 'Follow-up' Questions:")
+print(f"RAG WITH HISTORY:    {mem_score:.4f}")
+print(f"\nRAG WITHOUT HISTORY: {no_mem_score:.4f}")
+
+gap = ((mem_score - no_mem_score) / no_mem_score) * 100
+print(f"\n        MEMORY IMPACT: +{gap:.1f}% Improvement in conversational accuracy")
+
+# Show the specific failures side-by-side
+cols = ['question', 'rag_answer', 'rag_without_history_answer', 'RAG_Hist_SAS', 'RAG_NoHist_SAS']
+print("\n Detailed Failure Analysis (Why No-History Fails):")
+display(df_memory_subset[cols])
