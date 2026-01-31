@@ -1,3 +1,5 @@
+Abstract
+
 Navigating academic syllabi can be a complex task for students, often involving the synthesis of frag-
 mented information regarding course contents, prerequisites, and administrative rules. This project
 is about SyllabusRAG, a Retrieval-Augmented Generation (RAG) system designed to act as an AI
