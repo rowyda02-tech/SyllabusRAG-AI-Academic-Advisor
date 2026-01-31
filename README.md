@@ -1,4 +1,4 @@
-Abstract
+**Abstract**
 
 Navigating academic syllabi can be a complex task for students, often involving the synthesis of frag-
 mented information regarding course contents, prerequisites, and administrative rules. This project
